@@ -33,6 +33,36 @@ const markjiApi = axios.create({
 
 // --- Helper Functions ---
 
+// Retry helper for API calls, useful for handling transient errors like DB locks
+async function withRetry<T>(apiCall: () => Promise<T>, options: { retries?: number, delay?: number } = {}): Promise<T> {
+    const { retries = 3, delay = 1000 } = options;
+    let lastError: Error | undefined;
+
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await apiCall();
+        } catch (error) {
+            lastError = error as Error;
+            // Only retry on specific network/server errors
+            if (axios.isAxiosError(error)) {
+                const statusCode = error.response?.status;
+                // Retry on 409 (Conflict), 429 (Too Many Requests), and 5xx server errors
+                if (statusCode && (statusCode === 409 || statusCode === 429 || statusCode >= 500)) {
+                    if (i < retries - 1) {
+                        // Exponential backoff
+                        await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
+                        continue;
+                    }
+                }
+            }
+            // For other errors, or if retries are exhausted, throw the last error
+            throw lastError;
+        }
+    }
+    // This line should be unreachable if retries > 0, but is needed for type safety.
+    throw lastError!;
+}
+
 // Based on the browser extension, new cards are added to the last chapter of a deck.
 async function getLastChapterId(deckId: string): Promise<string> {
   try {
@@ -72,11 +102,11 @@ async function uploadImageFromUrl(imageUrl: string): Promise<string> {
         });
 
         // 3. Upload to Markji
-        const uploadResponse = await markjiApi.post('/files', formData, {
+        const uploadResponse = await withRetry(() => markjiApi.post('/files', formData, {
             headers: {
                 ...formData.getHeaders() // Important for multipart/form-data
             }
-        });
+        }));
 
         const fileId = uploadResponse.data?.data?.file?.id;
         if (!fileId) {
@@ -244,57 +274,55 @@ server.tool(
         const targetChapterId = chapterId || await getLastChapterId(deckId);
         
         const cardsArray = Array.isArray(cards) ? cards : [cards];
+        
+        const createdCards: { cardId: string, content: string }[] = [];
+        const failedCards: { content: string, error: string }[] = [];
 
-        // Use Promise.allSettled to send requests concurrently
-        const promises = cardsArray.map((card, index) => {
+        // Process cards serially to avoid overwhelming the API or causing DB locks.
+        for (const [index, card] of cardsArray.entries()) {
             const cardContent = card.backContent ? `${card.content}\n---\n${card.backContent}` : card.content;
             const payload = {
-                order: index + 1, // Add order based on array position
+                order: index + 1,
                 card: {
                     content: cardContent,
-                    grammar_version: 3, // Update grammar_version to 3
+                    grammar_version: 3,
                 },
             };
-            return markjiApi.post(`/decks/${deckId}/chapters/${targetChapterId}/cards`, payload);
-        });
+            
+            try {
+                const response = await withRetry(() => 
+                    markjiApi.post(`/decks/${deckId}/chapters/${targetChapterId}/cards`, payload)
+                );
 
-        const settledResults = await Promise.allSettled(promises);
-
-        const results: string[] = [];
-        let successCount = 0;
-        let failureCount = 0;
-
-        settledResults.forEach((result, index) => {
-            const cardContent = cardsArray[index].content.substring(0, 20);
-            if (result.status === 'fulfilled') {
-                const response = result.value;
                 if (response.data?.success) {
-                    results.push(`✅ Successfully created card: ${response.data.data.card.id}`);
-                    successCount++;
+                    createdCards.push({
+                        cardId: response.data.data.card.id,
+                        content: card.content.substring(0, 50) + '...'
+                    });
                 } else {
                     const errorMessage = response.data?.errors?.[0]?.message || 'Unknown API error';
-                    results.push(`❌ Failed to create card "${cardContent}...": ${errorMessage}`);
-                    failureCount++;
+                    failedCards.push({ content: card.content.substring(0, 50) + '...', error: errorMessage });
                 }
-            } else {
-                // Handle rejected promises (network errors, etc.)
+            } catch (error) {
                 let errorMessage = 'An unknown error occurred';
-                if (axios.isAxiosError(result.reason)) {
-                    errorMessage = result.reason.response?.data?.errors?.[0]?.message || `Status ${result.reason.response?.status}: ${result.reason.message}`;
-                } else if (result.reason instanceof Error) {
-                    errorMessage = result.reason.message;
+                if (axios.isAxiosError(error)) {
+                    errorMessage = error.response?.data?.errors?.[0]?.message || `Status ${error.response?.status}: ${error.message}`;
+                } else if (error instanceof Error) {
+                    errorMessage = error.message;
                 }
-                results.push(`❌ Failed to create card "${cardContent}...": ${errorMessage}`);
-                failureCount++;
+                failedCards.push({ content: card.content.substring(0, 50) + '...', error: errorMessage });
             }
-        });
+        }
 
-        const summary = `Batch operation summary: ${successCount} succeeded, ${failureCount} failed.`;
-        const report = [summary, ...results].join('\n');
+        const report = {
+            summary: `Batch operation summary: ${createdCards.length} succeeded, ${failedCards.length} failed.`,
+            createdCards,
+            failedCards
+        };
 
         return {
-            content: [{ type: "text", text: report }],
-            isError: failureCount > 0
+            content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+            isError: failedCards.length > 0
         };
 
     } catch (error) {
@@ -333,11 +361,17 @@ server.tool(
                 },
             };
 
-            const response = await markjiApi.post(`/decks/${deckId}/chapters/${targetChapterId}/cards`, payload);
+            const response = await withRetry(() => 
+                markjiApi.post(`/decks/${deckId}/chapters/${targetChapterId}/cards`, payload)
+            );
 
             if (response.data?.success) {
+                const cardId = response.data.data.card.id;
                 return {
-                    content: [{ type: "text", text: `Successfully created image card with ID: ${response.data.data.card.id}` }],
+                    content: [{ type: "text", text: JSON.stringify({
+                        message: `Successfully created image card with ID: ${cardId}`,
+                        cardId: cardId
+                    }, null, 2) }],
                 };
             } else {
                 const errorMessage = response.data?.errors?.[0]?.message || 'Unknown error from Markji API.';
@@ -409,7 +443,7 @@ server.tool(
             is_private: isPrivate,
             folder_id: folderId
         };
-        const response = await markjiApi.post('/decks', payload);
+        const response = await withRetry(() => markjiApi.post('/decks', payload));
 
         if (response.data?.success) {
             const newDeck = response.data.data.deck;
@@ -418,7 +452,9 @@ server.tool(
             // Now, create a default chapter for the new deck
             try {
                 const chapterPayload = { name: "默认章节" }; // Default chapter name
-                const chapterResponse = await markjiApi.post(`/decks/${newDeckId}/chapters`, chapterPayload);
+                const chapterResponse = await withRetry(() => 
+                    markjiApi.post(`/decks/${newDeckId}/chapters`, chapterPayload)
+                );
 
                 if (chapterResponse.data?.success) {
                     const newChapter = chapterResponse.data.data.chapter;
@@ -492,55 +528,43 @@ server.tool(
     try {
         const chaptersArray = Array.isArray(chapters) ? chapters : [chapters];
 
-        const promises = chaptersArray.map(chapter => {
+        const createdChapters: { name: string, id: string }[] = [];
+        const failedChapters: { name: string, error: string }[] = [];
+
+        for (const chapter of chaptersArray) {
             const payload = { name: chapter.name };
-            return markjiApi.post(`/decks/${deckId}/chapters`, payload);
-        });
-        const settledResults = await Promise.allSettled(promises);
+            try {
+                const response = await withRetry(() => 
+                    markjiApi.post(`/decks/${deckId}/chapters`, payload)
+                );
 
-        const results: string[] = [];
-        const createdChaptersMap: { [name: string]: string } = {}; // For the new return value
-        let successCount = 0;
-        let failureCount = 0;
-
-        settledResults.forEach((result, index) => {
-            const chapterName = chaptersArray[index].name;
-            if (result.status === 'fulfilled') {
-                const response = result.value;
                 if (response.data?.success) {
                     const newChapter = response.data.data.chapter;
-                    results.push(`✅ Successfully created chapter: ${newChapter.id}`);
-                    createdChaptersMap[chapterName] = newChapter.id; // Populate the map
-                    successCount++;
+                    createdChapters.push({ name: chapter.name, id: newChapter.id });
                 } else {
                     const errorMessage = response.data?.errors?.[0]?.message || 'Unknown API error';
-                    results.push(`❌ Failed to create chapter "${chapterName}": ${errorMessage}`);
-                    failureCount++;
+                    failedChapters.push({ name: chapter.name, error: errorMessage });
                 }
-            } else {
+            } catch (error) {
                 let errorMessage = 'An unknown error occurred';
-                if (axios.isAxiosError(result.reason)) {
-                    errorMessage = result.reason.response?.data?.errors?.[0]?.message || `Status ${result.reason.response?.status}: ${result.reason.message}`;
-                } else if (result.reason instanceof Error) {
-                    errorMessage = result.reason.message;
+                if (axios.isAxiosError(error)) {
+                    errorMessage = error.response?.data?.errors?.[0]?.message || `Status ${error.response?.status}: ${error.message}`;
+                } else if (error instanceof Error) {
+                    errorMessage = error.message;
                 }
-                results.push(`❌ Failed to create chapter "${chapterName}": ${errorMessage}`);
-                failureCount++;
+                failedChapters.push({ name: chapter.name, error: errorMessage });
             }
-        });
+        }
 
-        const summary = `Batch operation summary: ${successCount} succeeded, ${failureCount} failed.`;
-        const report = [summary, ...results].join('\n');
-        
-        // New return structure
-        const finalReport = {
-            summary: report,
-            createdChapters: createdChaptersMap
+        const report = {
+            summary: `Batch operation summary: ${createdChapters.length} succeeded, ${failedChapters.length} failed.`,
+            createdChapters,
+            failedChapters
         };
 
         return {
-            content: [{ type: "text", text: JSON.stringify(finalReport, null, 2) }],
-            isError: failureCount > 0
+            content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+            isError: failedChapters.length > 0
         };
 
     } catch (error) {
@@ -624,7 +648,9 @@ server.tool(
             toChapterId = targetChapter.id;
         } else {
             // 1c. If chapter does not exist, create it
-            const createChapterResponse = await markjiApi.post(`/decks/${deckId}/chapters`, { name: toChapterName });
+            const createChapterResponse = await withRetry(() => 
+                markjiApi.post(`/decks/${deckId}/chapters`, { name: toChapterName })
+            );
             if (!createChapterResponse.data?.success) {
                 const errorMessage = createChapterResponse.data?.errors?.[0]?.message || 'Failed to create new chapter';
                 throw new Error(errorMessage);
@@ -639,11 +665,19 @@ server.tool(
             order: order || 0
         };
 
-        const moveResponse = await markjiApi.post(`/decks/${deckId}/chapters/${fromChapterId}/cards/move`, movePayload);
+        const moveResponse = await withRetry(() => 
+            markjiApi.post(`/decks/${deckId}/chapters/${fromChapterId}/cards/move`, movePayload)
+        );
 
         if (moveResponse.data?.success) {
             return {
-                content: [{ type: "text", text: `Successfully moved ${cardIds.length} card(s) to chapter "${toChapterName}" (ID: ${toChapterId}).` }],
+                content: [{ type: "text", text: JSON.stringify({
+                    message: `Successfully moved ${cardIds.length} card(s) to chapter "${toChapterName}".`,
+                    deckId: deckId,
+                    toChapterId: toChapterId,
+                    toChapterName: toChapterName,
+                    movedCardIds: cardIds
+                }, null, 2) }],
             };
         } else {
             const errorMessage = moveResponse.data?.errors?.[0]?.message || 'Unknown error during card move operation.';
@@ -700,9 +734,9 @@ server.tool(
                     toChapterId = chapterMap.get(operation.toChapterName)!;
                 } else {
                     // Create new chapter
-                    const createResponse = await markjiApi.post(`/decks/${deckId}/chapters`, {
+                    const createResponse = await withRetry(() => markjiApi.post(`/decks/${deckId}/chapters`, {
                         name: operation.toChapterName
-                    });
+                    }));
                     
                     if (!createResponse.data?.success) {
                         const errorMessage = createResponse.data?.errors?.[0]?.message || 'Failed to create chapter';
@@ -721,10 +755,10 @@ server.tool(
                     order: operation.order
                 };
 
-                const moveResponse = await markjiApi.post(
+                const moveResponse = await withRetry(() => markjiApi.post(
                     `/decks/${deckId}/chapters/${operation.fromChapterId}/cards/move`,
                     movePayload
-                );
+                ));
 
                 if (moveResponse.data?.success) {
                     results.push(`✅ Moved ${operation.cardIds.length} card(s) to "${operation.toChapterName}"`);
@@ -853,11 +887,16 @@ server.tool(
             }
         };
 
-        const response = await markjiApi.post(`/decks/${deckId}/cards/${cardId}`, payload);
+        const response = await withRetry(() => 
+            markjiApi.post(`/decks/${deckId}/cards/${cardId}`, payload)
+        );
 
         if (response.data?.success) {
             return {
-                content: [{ type: "text", text: `Successfully updated card ${cardId}` }],
+                content: [{ type: "text", text: JSON.stringify({
+                    message: `Successfully updated card ${cardId}`,
+                    cardId: cardId
+                }, null, 2) }],
             };
         } else {
             const errorMessage = response.data?.errors?.[0]?.message || 'Unknown error from Markji API.';
@@ -895,52 +934,46 @@ server.tool(
               }
           }
   
-          // 2. Create a delete promise for each card.
-          const deletePromises = cardIds.map(cardId => {
+          // 2. Sequentially delete each card to avoid race conditions.
+          const deletedCards: { cardId: string }[] = [];
+          const failedCards: { cardId: string, error: string }[] = [];
+
+          for (const cardId of cardIds) {
               const chapterId = cardToChapterMap.get(cardId);
               if (!chapterId) {
-                  // Return a rejected promise for cards not found
-                  return Promise.reject(new Error(`Card ${cardId} not found in any chapter.`));
+                  failedCards.push({ cardId, error: `Card not found in any chapter.` });
+                  continue;
               }
-              return markjiApi.delete(`/decks/${deckId}/chapters/${chapterId}/cards/${cardId}`);
-          });
-  
-          // 3. Execute all delete promises concurrently.
-          const settledResults = await Promise.allSettled(deletePromises);
-  
-          const results: string[] = [];
-          let successCount = 0;
-          let failureCount = 0;
-  
-          settledResults.forEach((result, index) => {
-              const cardId = cardIds[index];
-              if (result.status === 'fulfilled') {
-                  const response = result.value;
+
+              try {
+                  const response = await withRetry(() => 
+                      markjiApi.delete(`/decks/${deckId}/chapters/${chapterId}/cards/${cardId}`)
+                  );
+
                   if (response.data?.success) {
-                      results.push(`✅ Successfully deleted card: ${cardId}`);
-                      successCount++;
+                      deletedCards.push({ cardId });
                   } else {
                       const errorMessage = response.data?.errors?.[0]?.message || 'Unknown API error';
-                      results.push(`❌ Failed to delete card ${cardId}: ${errorMessage}`);
-                      failureCount++;
+                      failedCards.push({ cardId, error: errorMessage });
                   }
-              } else {
-                  // Handle rejected promises (e.g., card not found, network errors)
+              } catch (error) {
                   let errorMessage = 'An unknown error occurred';
-                  if (result.reason instanceof Error) {
-                      errorMessage = result.reason.message;
+                  if (error instanceof Error) {
+                      errorMessage = error.message;
                   }
-                  results.push(`❌ Failed to delete card ${cardId}: ${errorMessage}`);
-                  failureCount++;
+                  failedCards.push({ cardId, error: errorMessage });
               }
-          });
+          }
   
-          const summary = `Delete operation completed: ${successCount} succeeded, ${failureCount} failed.`;
-          const report = [summary, ...results].join('\n');
+          const report = {
+              summary: `Delete operation completed: ${deletedCards.length} succeeded, ${failedCards.length} failed.`,
+              deletedCards,
+              failedCards
+          };
   
           return {
-              content: [{ type: "text", text: report }],
-              isError: failureCount > 0
+              content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+              isError: failedCards.length > 0
           };
   
       } catch (error) {
@@ -974,68 +1007,55 @@ server.tool(
         const cardIds = updates.map(update => update.cardId);
         const cardDetailsMap = await batchGetCardDetails(deckId, cardIds);
         
-        // Step 2: Prepare update promises using the fetched card details
-        const updatePromises = updates.map(async (update) => {
+        const updatedCards: { cardId: string }[] = [];
+        const failedUpdates: { cardId: string, error: string }[] = [];
+
+        // Step 2: Process updates serially
+        for (const update of updates) {
+            const { cardId, content, backContent } = update;
             try {
-                const currentCard = cardDetailsMap.get(update.cardId);
+                const currentCard = cardDetailsMap.get(cardId);
                 if (!currentCard) {
-                    throw new Error(`Card details not found for card ${update.cardId}`);
+                    throw new Error(`Original card details not found for card ${cardId}. Skipping update.`);
                 }
                 
-                // Format the new content
-                const newContent = update.backContent ? `${update.content}\n---\n${update.backContent}` : update.content;
+                const newContent = backContent ? `${content}\n---\n${backContent}` : content;
                 
                 const payload = {
                     card: {
                         content: newContent,
-                        grammar_version: currentCard.grammar_version // Preserve the original grammar_version
+                        grammar_version: currentCard.grammar_version
                     }
                 };
 
-                const response = await markjiApi.post(`/decks/${deckId}/cards/${update.cardId}`, payload);
-                return { cardId: update.cardId, response, success: true };
-            } catch (error) {
-                return { cardId: update.cardId, error, success: false };
-            }
-        });
+                const response = await withRetry(() => 
+                    markjiApi.post(`/decks/${deckId}/cards/${cardId}`, payload)
+                );
 
-        // Step 3: Execute all updates concurrently
-        const settledResults = await Promise.allSettled(updatePromises);
-        
-        const results: string[] = [];
-        let successCount = 0;
-        let failureCount = 0;
-
-        settledResults.forEach((result, index) => {
-            const cardId = updates[index].cardId;
-            
-            if (result.status === 'fulfilled') {
-                const { success, response, error } = result.value;
-                if (success && response?.data?.success) {
-                    results.push(`✅ Successfully updated card: ${cardId}`);
-                    successCount++;
+                if (response.data?.success) {
+                    updatedCards.push({ cardId });
                 } else {
-                    const errorMessage = response?.data?.errors?.[0]?.message ||
-                        (error instanceof Error ? error.message : 'Unknown error');
-                    results.push(`❌ Failed to update card ${cardId}: ${errorMessage}`);
-                    failureCount++;
+                    const errorMessage = response.data?.errors?.[0]?.message || 'Unknown API error';
+                    throw new Error(errorMessage);
                 }
-            } else {
+            } catch (error) {
                 let errorMessage = 'An unknown error occurred';
-                if (result.reason instanceof Error) {
-                    errorMessage = result.reason.message;
+                if (error instanceof Error) {
+                    errorMessage = error.message;
                 }
-                results.push(`❌ Failed to update card ${cardId}: ${errorMessage}`);
-                failureCount++;
+                failedUpdates.push({ cardId, error: errorMessage });
             }
-        });
+        }
 
-        const summary = `Batch update completed: ${successCount} succeeded, ${failureCount} failed.`;
-        const report = [summary, ...results].join('\n');
+        const report = {
+            summary: `Batch update completed: ${updatedCards.length} succeeded, ${failedUpdates.length} failed.`,
+            updatedCards,
+            failedUpdates
+        };
 
         return {
-            content: [{ type: "text", text: report }],
-            isError: failureCount > 0
+            content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+            isError: failedUpdates.length > 0
         };
 
     } catch (error) {
@@ -1073,108 +1093,87 @@ server.tool(
             chapterMap.set(ch.name, ch.id);
         });
 
-        const results: string[] = [];
+        const report: {
+            createdChapters: { name: string, id: string }[],
+            processedChapters: {
+                chapterName: string,
+                chapterId: string,
+                createdCards: { cardId: string, content: string }[],
+                failedCards: { content: string, error: string }[]
+            }[],
+            failedChapters: { chapterName: string, error: string }[]
+        } = { createdChapters: [], processedChapters: [], failedChapters: [] };
+
         let totalSuccessCount = 0;
         let totalFailureCount = 0;
-        const createdChapters: string[] = [];
 
-        // Step 2: Process each chapter and its cards
+        // Step 2: Process each chapter and its cards serially
         for (const chapterData of chapterCards) {
             const { chapterName, cards } = chapterData;
-            
+            let chapterId: string;
+
             try {
                 // Step 2a: Find or create the chapter
-                let chapterId: string;
-                
                 if (chapterMap.has(chapterName)) {
                     chapterId = chapterMap.get(chapterName)!;
                 } else {
-                    // Create new chapter
-                    const createChapterResponse = await markjiApi.post(`/decks/${deckId}/chapters`, {
-                        name: chapterName
-                    });
-                    
+                    const createChapterResponse = await withRetry(() => markjiApi.post(`/decks/${deckId}/chapters`, { name: chapterName }));
                     if (!createChapterResponse.data?.success) {
-                        const errorMessage = createChapterResponse.data?.errors?.[0]?.message || 'Failed to create chapter';
-                        results.push(`❌ Failed to create chapter "${chapterName}": ${errorMessage}`);
-                        totalFailureCount += cards.length; // Count all cards as failed
-                        continue;
+                        throw new Error(createChapterResponse.data?.errors?.[0]?.message || 'Failed to create chapter');
                     }
-                    
                     chapterId = createChapterResponse.data.data.chapter.id;
                     chapterMap.set(chapterName, chapterId);
-                    createdChapters.push(chapterName);
-                    results.push(`📁 Created new chapter: "${chapterName}" (ID: ${chapterId})`);
+                    report.createdChapters.push({ name: chapterName, id: chapterId });
                 }
 
-                // Step 2b: Add all cards to this chapter concurrently
-                const cardPromises = cards.map((card, index) => {
+                // Step 2b: Add all cards to this chapter serially
+                const chapterReport = {
+                    chapterName,
+                    chapterId,
+                    createdCards: [] as { cardId: string, content: string }[],
+                    failedCards: [] as { content: string, error: string }[]
+                };
+
+                for (const [index, card] of cards.entries()) {
                     const cardContent = card.backContent ? `${card.content}\n---\n${card.backContent}` : card.content;
                     const payload = {
                         order: index + 1,
-                        card: {
-                            content: cardContent,
-                            grammar_version: 3,
-                        },
+                        card: { content: cardContent, grammar_version: 3 },
                     };
-                    return markjiApi.post(`/decks/${deckId}/chapters/${chapterId}/cards`, payload);
-                });
-
-                const cardResults = await Promise.allSettled(cardPromises);
-                let chapterSuccessCount = 0;
-                let chapterFailureCount = 0;
-
-                cardResults.forEach((result, index) => {
-                    const cardContent = cards[index].content.substring(0, 20);
-                    if (result.status === 'fulfilled') {
-                        const response = result.value;
+                    try {
+                        const response = await withRetry(() => markjiApi.post(`/decks/${deckId}/chapters/${chapterId}/cards`, payload));
                         if (response.data?.success) {
-                            chapterSuccessCount++;
+                            chapterReport.createdCards.push({ cardId: response.data.data.card.id, content: card.content.substring(0, 50) + '...' });
                         } else {
-                            const errorMessage = response.data?.errors?.[0]?.message || 'Unknown API error';
-                            results.push(`  ❌ Failed to create card "${cardContent}..." in "${chapterName}": ${errorMessage}`);
-                            chapterFailureCount++;
+                            throw new Error(response.data?.errors?.[0]?.message || 'Unknown API error');
                         }
-                    } else {
+                    } catch (error) {
                         let errorMessage = 'An unknown error occurred';
-                        if (axios.isAxiosError(result.reason)) {
-                            errorMessage = result.reason.response?.data?.errors?.[0]?.message ||
-                                `Status ${result.reason.response?.status}: ${result.reason.message}`;
-                        } else if (result.reason instanceof Error) {
-                            errorMessage = result.reason.message;
-                        }
-                        results.push(`  ❌ Failed to create card "${cardContent}..." in "${chapterName}": ${errorMessage}`);
-                        chapterFailureCount++;
+                        if (error instanceof Error) errorMessage = error.message;
+                        chapterReport.failedCards.push({ content: card.content.substring(0, 50) + '...', error: errorMessage });
                     }
-                });
-
-                if (chapterSuccessCount > 0) {
-                    results.push(`  ✅ Successfully added ${chapterSuccessCount} card(s) to "${chapterName}"`);
                 }
-
-                totalSuccessCount += chapterSuccessCount;
-                totalFailureCount += chapterFailureCount;
+                
+                report.processedChapters.push(chapterReport);
+                totalSuccessCount += chapterReport.createdCards.length;
+                totalFailureCount += chapterReport.failedCards.length;
 
             } catch (error) {
                 let errorMessage = 'An unknown error occurred';
-                if (error instanceof Error) {
-                    errorMessage = error.message;
-                }
-                results.push(`❌ Failed to process chapter "${chapterName}": ${errorMessage}`);
-                totalFailureCount += cards.length;
+                if (error instanceof Error) errorMessage = error.message;
+                report.failedChapters.push({ chapterName, error: errorMessage });
+                totalFailureCount += cards.length; // Count all cards as failed for this chapter
             }
         }
 
         // Step 3: Generate summary report
-        const summary = `Batch add operation completed: ${totalSuccessCount} cards added successfully, ${totalFailureCount} failed.`;
-        const createdChaptersSummary = createdChapters.length > 0 ?
-            `Created ${createdChapters.length} new chapter(s): ${createdChapters.join(', ')}` :
-            'No new chapters were created.';
-        
-        const report = [summary, createdChaptersSummary, '', ...results].join('\n');
+        const finalReport = {
+            summary: `Batch operation completed: ${totalSuccessCount} cards added, ${totalFailureCount} failed.`,
+            ...report
+        };
 
         return {
-            content: [{ type: "text", text: report }],
+            content: [{ type: "text", text: JSON.stringify(finalReport, null, 2) }],
             isError: totalFailureCount > 0
         };
 
